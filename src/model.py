@@ -125,14 +125,29 @@ class AlphaForge:
                 stack_types.append('unknown')
 
         if len(state) == self.max_length:  # At max_length, must terminate
+            # CRITICAL: We should NEVER reach here with invalid stack state
+            # If we do, it means our earlier logic failed
             # Only allow SEP if stack has exactly 1 tensor
-            # Otherwise, this will cause assertion failure
             if len(stack) == 1 and len(stack_types) > 0 and stack_types[0] == 'tensor':
                 valid_actions[self.offset_sep] = 1
             else:
-                # Invalid state - no good options, but need to prevent crash
-                # Allow SEP anyway and let assertion handle it (will be caught higher up)
-                valid_actions[self.offset_sep] = 1
+                # This is a bug - we shouldn't be here
+                # But we need to do SOMETHING to avoid infinite loop
+                # Try to recover by allowing operations that might help
+                if len(stack) == 0:
+                    # Extremely bad - no stack at all
+                    # This should never happen
+                    pass  # No valid actions - will cause issues but indicates serious bug
+                elif len(stack) == 2 and stack_types == ['tensor', 'tensor']:
+                    # Try to combine them (though it's too late)
+                    valid_actions[self.offset_binary:self.offset_rolling] = 1
+                elif len(stack) == 2 and stack_types == ['tensor', 'window']:
+                    # Try to apply rolling op (though it's too late)
+                    valid_actions[self.offset_rolling:self.offset_rolling_binary] = 1
+                elif len(stack) >= 1:
+                    # As last resort, just allow SEP and let it fail cleanly
+                    # The assertion will catch this and it will be easier to debug
+                    valid_actions[self.offset_sep] = 1
             return valid_actions
 
         # Decision based on stack state
@@ -150,12 +165,17 @@ class AlphaForge:
                 valid_actions[self.offset_unary:self.offset_binary] = 1  # unary ops only (not binary/rolling yet)
                 valid_actions[self.offset_feature:self.offset_sep+1] = 1  # features, constants, delta times, AND SEP
                 
-                # Safety: if we're getting close to max_length, don't add more complexity
+                # Safety: if we're getting close to max_length, be very restrictive
                 if len(state) >= self.max_length - 3:
-                    # Prefer finishing or simple unary ops
-                    valid_actions[self.offset_feature:self.offset_constant] = 0  # no new features
+                    # Only allow finishing or simple unary that doesn't grow stack
+                    valid_actions[:] = 0
+                    valid_actions[self.offset_unary:self.offset_binary] = 1  # unary ops
+                    valid_actions[self.offset_sep] = 1  # SEP
+                    # No features, no constants, no delta times - these would grow the stack
+                elif len(state) >= self.max_length - 5:
+                    # Getting close - discourage complex operations
                     valid_actions[self.offset_delta_time:self.offset_sep] = 0  # no delta times
-                    # Keep: unary ops, constants, SEP
+                    # Still allow features and constants for binary ops, but not rolling
                 
             elif stack_types[0] == 'window':
                 # Just a window on stack - invalid, need tensor first
@@ -168,11 +188,15 @@ class AlphaForge:
                 valid_actions[self.offset_unary:self.offset_rolling] = 1  # unary and binary ops
                 valid_actions[self.offset_delta_time:self.offset_sep] = 1  # can add window for rolling binary
                 
-                # Safety: if close to max_length, don't add more elements
+                # Safety: if close to max_length, must combine immediately
                 if len(state) >= self.max_length - 2:
-                    # Must combine the two tensors - only allow binary ops
+                    # MUST combine the two tensors - only allow binary ops
                     valid_actions[:] = 0
                     valid_actions[self.offset_binary:self.offset_rolling] = 1
+                elif len(state) >= self.max_length - 4:
+                    # Getting close - don't add more complexity
+                    # Don't allow adding window (which would require another op after)
+                    valid_actions[self.offset_delta_time:self.offset_sep] = 0
                 
             elif stack_types == ['tensor', 'window']:
                 # Tensor + window: can ONLY apply rolling unary op now
