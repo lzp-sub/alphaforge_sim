@@ -454,14 +454,15 @@ def generate_operators(window_sizes, include_constants=True):
 
     # Add rolling operators for each window size
     for window in window_sizes:
-        unary_ops[f'TsMean_{window}'] = lambda w=window: lambda op: TsMean(op, w)
-        unary_ops[f'TsStd_{window}'] = lambda w=window: lambda op: TsStd(op, w)
-        unary_ops[f'TsMax_{window}'] = lambda w=window: lambda op: TsMax(op, w)
-        unary_ops[f'TsMin_{window}'] = lambda w=window: lambda op: TsMin(op, w)
-        unary_ops[f'PctChange_{window}'] = lambda w=window: lambda op: PctChange(op, w)
-        unary_ops[f'Lag_{window}'] = lambda w=window: lambda op: Lag(op, w)
+        # Use factory functions with default parameters to avoid closure issues
+        unary_ops[f'TsMean_{window}'] = (lambda w: lambda op: TsMean(op, w))(window)
+        unary_ops[f'TsStd_{window}'] = (lambda w: lambda op: TsStd(op, w))(window)
+        unary_ops[f'TsMax_{window}'] = (lambda w: lambda op: TsMax(op, w))(window)
+        unary_ops[f'TsMin_{window}'] = (lambda w: lambda op: TsMin(op, w))(window)
+        unary_ops[f'PctChange_{window}'] = (lambda w: lambda op: PctChange(op, w))(window)
+        unary_ops[f'Lag_{window}'] = (lambda w: lambda op: Lag(op, w))(window)
         
-        binary_ops[f'TsCorr_{window}'] = lambda w=window: lambda lhs, rhs: TsCorr(lhs, rhs, w)
+        binary_ops[f'TsCorr_{window}'] = (lambda w: lambda lhs, rhs: TsCorr(lhs, rhs, w))(window)
     
     constants = {}
     if include_constants:

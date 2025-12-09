@@ -136,18 +136,21 @@ class AlphaForge:
         if action < self.offset_binary: # action = unary ops
             operand = stack.pop()
             operator_class = self.unary_ops[token]
+            
             # Check if it's a rolling operator (returns a lambda)
             if callable(operator_class) and not isinstance(operator_class, type):
-                # It's a lambda that creates the operator
+                # It's a lambda that creates the operator - call it to get the instance
                 operator = operator_class(operand)
             else:
-                # It's a regular operator class
+                # It's a regular operator class - instantiate it
                 operator = operator_class(operand)
             
-            # If operand is a tensor, compute directly; if Expression, store the expression tree
+            # For tensor operands, compute directly; for expressions, store the operator
             if isinstance(operand, torch.Tensor):
-                result = operator.evaluate({}) if hasattr(operator, 'evaluate') else operator._compute(operand)
+                # Use _compute for efficiency when working with tensors directly
+                result = operator._compute(operand)
             else:
+                # Store the operator for expression tree building
                 result = operator
             stack.append(result)
             
@@ -155,18 +158,21 @@ class AlphaForge:
             rhs = stack.pop()
             lhs = stack.pop()
             operator_class = self.binary_ops[token]
+            
             # Check if it's a rolling operator (returns a lambda)
             if callable(operator_class) and not isinstance(operator_class, type):
-                # It's a lambda that creates the operator
+                # It's a lambda that creates the operator - call it to get the instance
                 operator = operator_class(lhs, rhs)
             else:
-                # It's a regular operator class
+                # It's a regular operator class - instantiate it
                 operator = operator_class(lhs, rhs)
             
-            # If both operands are tensors, compute directly
+            # For tensor operands, compute directly; for expressions, store the operator
             if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
-                result = operator.evaluate({}) if hasattr(operator, 'evaluate') else operator._compute(lhs, rhs)
+                # Use _compute for efficiency when working with tensors directly
+                result = operator._compute(lhs, rhs)
             else:
+                # Store the operator for expression tree building
                 result = operator
             stack.append(result)
             
@@ -523,27 +529,27 @@ class AlphaForge:
         for token in self.unary_op_names:
             if 'TsMean_' in token or 'ts_mean_' in token:
                 window = int(token.split('_')[-1])
-                local_env[f'ts_mean_{window}'] = lambda x, w=window: TsMean(None, w)._compute(x)
+                local_env[f'ts_mean_{window}'] = (lambda w: lambda x: TsMean(None, w)._compute(x))(window)
             elif 'TsStd_' in token or 'ts_std_' in token:
                 window = int(token.split('_')[-1])
-                local_env[f'ts_std_{window}'] = lambda x, w=window: TsStd(None, w)._compute(x)
+                local_env[f'ts_std_{window}'] = (lambda w: lambda x: TsStd(None, w)._compute(x))(window)
             elif 'TsMax_' in token or 'ts_max_' in token:
                 window = int(token.split('_')[-1])
-                local_env[f'ts_max_{window}'] = lambda x, w=window: TsMax(None, w)._compute(x)
+                local_env[f'ts_max_{window}'] = (lambda w: lambda x: TsMax(None, w)._compute(x))(window)
             elif 'TsMin_' in token or 'ts_min_' in token:
                 window = int(token.split('_')[-1])
-                local_env[f'ts_min_{window}'] = lambda x, w=window: TsMin(None, w)._compute(x)
+                local_env[f'ts_min_{window}'] = (lambda w: lambda x: TsMin(None, w)._compute(x))(window)
             elif 'PctChange_' in token or 'pctchange_' in token:
                 window = int(token.split('_')[-1])
-                local_env[f'pctchange_{window}'] = lambda x, w=window: PctChange(None, w)._compute(x)
+                local_env[f'pctchange_{window}'] = (lambda w: lambda x: PctChange(None, w)._compute(x))(window)
             elif 'Lag_' in token or 'lag_' in token:
                 window = int(token.split('_')[-1])
-                local_env[f'lag_{window}'] = lambda x, w=window: Lag(None, w)._compute(x)
+                local_env[f'lag_{window}'] = (lambda w: lambda x: Lag(None, w)._compute(x))(window)
         
         for token in self.binary_op_names:
             if 'TsCorr_' in token or 'ts_corr_' in token:
                 window = int(token.split('_')[-1])
-                local_env[f'ts_corr_{window}'] = lambda x, y, w=window: TsCorr(None, None, w)._compute(x, y)
+                local_env[f'ts_corr_{window}'] = (lambda w: lambda x, y: TsCorr(None, None, w)._compute(x, y))(window)
         
         # Add legacy function-based operators for backward compatibility
         local_env['ops_abs'] = ops_abs
