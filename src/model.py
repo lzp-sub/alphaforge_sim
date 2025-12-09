@@ -141,7 +141,7 @@ class AlphaForge:
                 # - Add a window size for rolling unary op
                 # - Finish with SEP
                 valid_actions[self.offset_unary:self.offset_binary] = 1  # unary ops only (not binary/rolling yet)
-                valid_actions[self.offset_feature:self.offset_sep] = 1  # features, constants, delta times, SEP
+                valid_actions[self.offset_feature:self.offset_sep+1] = 1  # features, constants, delta times, AND SEP
                 
             elif stack_types[0] == 'window':
                 # Just a window on stack - invalid, need tensor first
