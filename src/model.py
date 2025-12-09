@@ -58,6 +58,32 @@ class AlphaForge:
     def _reset_net(self):
         self.netp.reset_params()
         self.netg.reset_params()
+    
+    def _create_operator(self, token, *operands):
+        """Helper method to create operator instances from token and operands
+        
+        Args:
+            token: The operator token name
+            *operands: Variable number of operands (1 for unary, 2 for binary)
+        
+        Returns:
+            The operator instance
+        """
+        # Get the operator class/function
+        if token in self.unary_ops:
+            operator_class = self.unary_ops[token]
+        elif token in self.binary_ops:
+            operator_class = self.binary_ops[token]
+        else:
+            raise ValueError(f"Unknown operator token: {token}")
+        
+        # Check if it's a rolling operator (returns a lambda) or a regular class
+        if callable(operator_class) and not isinstance(operator_class, type):
+            # It's a lambda factory that creates the operator
+            return operator_class(*operands)
+        else:
+            # It's a regular operator class - instantiate it
+            return operator_class(*operands)
 
     def _action_to_token(self, action: int) -> str: 
         if action < self.offset_unary or action > self.offset_sep:
@@ -135,15 +161,7 @@ class AlphaForge:
         
         if action < self.offset_binary: # action = unary ops
             operand = stack.pop()
-            operator_class = self.unary_ops[token]
-            
-            # Check if it's a rolling operator (returns a lambda)
-            if callable(operator_class) and not isinstance(operator_class, type):
-                # It's a lambda that creates the operator - call it to get the instance
-                operator = operator_class(operand)
-            else:
-                # It's a regular operator class - instantiate it
-                operator = operator_class(operand)
+            operator = self._create_operator(token, operand)
             
             # For tensor operands, compute directly; for expressions, store the operator
             if isinstance(operand, torch.Tensor):
@@ -157,15 +175,7 @@ class AlphaForge:
         elif action < self.offset_feature: # action = binary ops
             rhs = stack.pop()
             lhs = stack.pop()
-            operator_class = self.binary_ops[token]
-            
-            # Check if it's a rolling operator (returns a lambda)
-            if callable(operator_class) and not isinstance(operator_class, type):
-                # It's a lambda that creates the operator - call it to get the instance
-                operator = operator_class(lhs, rhs)
-            else:
-                # It's a regular operator class - instantiate it
-                operator = operator_class(lhs, rhs)
+            operator = self._create_operator(token, lhs, rhs)
             
             # For tensor operands, compute directly; for expressions, store the operator
             if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
@@ -499,17 +509,14 @@ class AlphaForge:
                                ops_abs, ops_log, ops_neg, ops_inv, ops_rank,
                                ops_add, ops_subtract, ops_multiply, ops_divide, ops_max, ops_min)
         
-        # Helper function to evaluate operators on tensors
-        def evaluate_operator(op_class, *args, **kwargs):
-            """Evaluate an operator class with tensor arguments"""
-            if len(args) == 1:
-                # Unary operator
-                return op_class(None, **kwargs)._compute(args[0])
-            elif len(args) == 2:
-                # Binary operator
-                return op_class(None, None, **kwargs)._compute(args[0], args[1])
-            else:
-                raise ValueError(f"Unexpected number of arguments: {len(args)}")
+        # Helper function to create a lambda that computes an operator
+        def make_unary_lambda(op_class, window):
+            """Create a lambda that computes a unary operator with window size"""
+            return (lambda w: lambda x: op_class(None, w)._compute(x))(window)
+        
+        def make_binary_lambda(op_class, window):
+            """Create a lambda that computes a binary operator with window size"""
+            return (lambda w: lambda x, y: op_class(None, None, w)._compute(x, y))(window)
         
         # Build local environment for eval
         local_env = {}
@@ -526,30 +533,32 @@ class AlphaForge:
         local_env['min'] = lambda x, y: Min(None, None)._compute(x, y)
         
         # Add rolling operators for each window size
+        operator_map_unary = {
+            'TsMean': TsMean, 'ts_mean': TsMean,
+            'TsStd': TsStd, 'ts_std': TsStd,
+            'TsMax': TsMax, 'ts_max': TsMax,
+            'TsMin': TsMin, 'ts_min': TsMin,
+            'PctChange': PctChange, 'pctchange': PctChange,
+            'Lag': Lag, 'lag': Lag
+        }
+        
         for token in self.unary_op_names:
-            if 'TsMean_' in token or 'ts_mean_' in token:
-                window = int(token.split('_')[-1])
-                local_env[f'ts_mean_{window}'] = (lambda w: lambda x: TsMean(None, w)._compute(x))(window)
-            elif 'TsStd_' in token or 'ts_std_' in token:
-                window = int(token.split('_')[-1])
-                local_env[f'ts_std_{window}'] = (lambda w: lambda x: TsStd(None, w)._compute(x))(window)
-            elif 'TsMax_' in token or 'ts_max_' in token:
-                window = int(token.split('_')[-1])
-                local_env[f'ts_max_{window}'] = (lambda w: lambda x: TsMax(None, w)._compute(x))(window)
-            elif 'TsMin_' in token or 'ts_min_' in token:
-                window = int(token.split('_')[-1])
-                local_env[f'ts_min_{window}'] = (lambda w: lambda x: TsMin(None, w)._compute(x))(window)
-            elif 'PctChange_' in token or 'pctchange_' in token:
-                window = int(token.split('_')[-1])
-                local_env[f'pctchange_{window}'] = (lambda w: lambda x: PctChange(None, w)._compute(x))(window)
-            elif 'Lag_' in token or 'lag_' in token:
-                window = int(token.split('_')[-1])
-                local_env[f'lag_{window}'] = (lambda w: lambda x: Lag(None, w)._compute(x))(window)
+            for prefix, op_class in operator_map_unary.items():
+                if prefix in token:
+                    window = int(token.split('_')[-1])
+                    local_env[f'{prefix.lower()}_{window}'] = make_unary_lambda(op_class, window)
+                    break
+        
+        operator_map_binary = {
+            'TsCorr': TsCorr, 'ts_corr': TsCorr
+        }
         
         for token in self.binary_op_names:
-            if 'TsCorr_' in token or 'ts_corr_' in token:
-                window = int(token.split('_')[-1])
-                local_env[f'ts_corr_{window}'] = (lambda w: lambda x, y: TsCorr(None, None, w)._compute(x, y))(window)
+            for prefix, op_class in operator_map_binary.items():
+                if prefix in token:
+                    window = int(token.split('_')[-1])
+                    local_env[f'{prefix.lower()}_{window}'] = make_binary_lambda(op_class, window)
+                    break
         
         # Add legacy function-based operators for backward compatibility
         local_env['ops_abs'] = ops_abs
@@ -563,23 +572,6 @@ class AlphaForge:
         local_env['ops_divide'] = ops_divide
         local_env['ops_max'] = ops_max
         local_env['ops_min'] = ops_min
-        
-        # Add legacy rolling operators
-        for token in self.unary_op_names:
-            if token in self.unary_ops:
-                op_func = self.unary_ops[token]
-                # For rolling operators created with lambda, we need to handle them
-                if 'rolling_mean' in token.lower() or 'lag' in token.lower() or 'pct' in token.lower():
-                    # These are already in the unary_ops as partial functions or lambdas
-                    # We'll try to add them if they're callable
-                    if callable(op_func):
-                        local_env[token] = op_func
-        
-        for token in self.binary_op_names:
-            if token in self.binary_ops:
-                op_func = self.binary_ops[token]
-                if callable(op_func):
-                    local_env[token] = op_func
         
         # Evaluate the expression
         result = eval(expression, {"__builtins__": {}}, local_env)
