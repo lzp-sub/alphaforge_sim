@@ -103,13 +103,14 @@ class AlphaForge:
         - Tensors (features, constants, computed results)
         - Window sizes (integers)
         
-        Rules:
-        - Empty stack: allow features and constants
-        - 1 element (tensor): allow unary ops, rolling ops (need window next), features, constants, binary ops need another tensor, SEP
-        - 1 element (window): invalid state
-        - 2 elements (tensor, tensor): allow binary ops and unary ops on either
-        - 2 elements (tensor, window): allow rolling unary ops
-        - 3 elements (tensor, tensor, window): allow rolling binary ops
+        Rules for rolling operators:
+        - Rolling unary needs: tensor, window (in that order on stack), then operator
+        - Rolling binary needs: tensor, tensor, window (in that order on stack), then operator
+        
+        So when we want to use rolling operators:
+        - First push operand(s)
+        - Then push window size
+        - Then apply rolling operator
         """
         valid_actions = torch.zeros(self.action_size, dtype=torch.bool, device=self.device)
 
@@ -129,42 +130,49 @@ class AlphaForge:
 
         # Decision based on stack state
         if len(stack) == 0:
-            # Empty stack: allow features and constants
+            # Empty stack: allow features and constants only
             valid_actions[self.offset_feature:self.offset_delta_time] = 1
             
         elif len(stack) == 1:
             if stack_types[0] == 'tensor':
-                # One tensor: allow unary ops, rolling ops, features, constants, SEP, or prepare for binary
-                valid_actions[self.offset_unary:self.offset_rolling] = 1  # unary ops
-                valid_actions[self.offset_rolling:self.offset_rolling_binary] = 1  # rolling ops (will need window next)
-                valid_actions[self.offset_feature:self.offset_delta_time] = 1  # features and constants (for binary)
-                valid_actions[self.offset_sep] = 1  # can finish
-                # Note: delta times not allowed yet - need to select rolling op first
+                # One tensor: can do several things
+                # - Apply unary op to it
+                # - Add another tensor/constant/feature for binary op
+                # - Add a window size for rolling unary op
+                # - Finish with SEP
+                valid_actions[self.offset_unary:self.offset_binary] = 1  # unary ops only (not binary/rolling yet)
+                valid_actions[self.offset_feature:self.offset_sep] = 1  # features, constants, delta times, SEP
+                
             elif stack_types[0] == 'window':
-                # Invalid - window needs a tensor first
+                # Just a window on stack - invalid, need tensor first
+                # This shouldn't happen, but set no valid actions
                 pass
                 
         elif len(stack) == 2:
             if stack_types == ['tensor', 'tensor']:
-                # Two tensors: allow binary ops and unary ops
-                valid_actions[self.offset_unary:self.offset_rolling_binary] = 1
+                # Two tensors: can apply binary ops or unary to either, or add window for rolling binary
+                valid_actions[self.offset_unary:self.offset_rolling] = 1  # unary and binary ops
+                valid_actions[self.offset_delta_time:self.offset_sep] = 1  # can add window for rolling binary
                 
             elif stack_types == ['tensor', 'window']:
-                # Tensor + window: must apply rolling unary op
+                # Tensor + window: can ONLY apply rolling unary op now
                 valid_actions[self.offset_rolling:self.offset_rolling_binary] = 1
                 
             elif stack_types == ['window', 'tensor']:
-                # Invalid order
+                # Wrong order - invalid
                 pass
                 
         elif len(stack) == 3:
             if stack_types == ['tensor', 'tensor', 'window']:
-                # Two tensors + window: must apply rolling binary op
+                # Two tensors + window: can ONLY apply rolling binary op
                 valid_actions[self.offset_rolling_binary:self.offset_feature] = 1
+            else:
+                # Other combinations shouldn't happen or are invalid
+                pass
                 
         # Special handling at max_length - 1
         if len(state) == self.max_length - 1:
-            # Must finish in one move
+            # Must finish in one move - need exactly 1 tensor result
             valid_actions[:] = 0
             if len(stack) == 1 and stack_types[0] == 'tensor':
                 # Can apply unary op to finish
@@ -176,6 +184,10 @@ class AlphaForge:
                 elif stack_types == ['tensor', 'window']:
                     # Can apply rolling unary op to finish
                     valid_actions[self.offset_rolling:self.offset_rolling_binary] = 1
+            elif len(stack) == 3:
+                if stack_types == ['tensor', 'tensor', 'window']:
+                    # Can apply rolling binary op to finish
+                    valid_actions[self.offset_rolling_binary:self.offset_feature] = 1
         
         # Enhanced masker: prevent meaningless double operations
         if state.shape[0] > 0:
@@ -205,15 +217,6 @@ class AlphaForge:
                 for i, name in enumerate(self.unary_op_names):
                     if 'Abs' in name:
                         valid_actions[self.offset_unary + i] = 0
-
-        # After selecting a rolling operator, we must select a window size
-        if len(stack) >= 1 and len(state) > 0:
-            prev_action = state[-1].argmax().item()
-            prev_token = self._action_to_token(prev_action)
-            # If previous action was a rolling operator, only allow delta times
-            if prev_token in self.rolling_op_names or prev_token in self.rolling_binary_op_names:
-                valid_actions[:] = 0
-                valid_actions[self.offset_delta_time:self.offset_sep] = 1
 
         return valid_actions
 
@@ -596,6 +599,15 @@ class AlphaForge:
         from .operators import (Abs, Log, Neg, Inv, Rank, Add, Sub, Mul, Div, Max, Min,
                                TsMean, TsStd, TsMax, TsMin, PctChange, Lag, TsCorr, Constant)
         
+        # Get a sample tensor shape for creating constant tensors
+        sample_tensor = next(iter(feature_data.values()))
+        
+        # Helper to convert scalar to tensor if needed
+        def to_tensor(x):
+            if isinstance(x, (int, float)):
+                return torch.full_like(sample_tensor, float(x))
+            return x
+        
         # Build local environment for eval
         local_env = {}
         
@@ -603,23 +615,23 @@ class AlphaForge:
         for feature_name in self.feature_names:
             local_env[feature_name] = feature_data[feature_name]
         
-        # Add operator classes with direct computation
-        local_env['abs'] = lambda x: Abs(None)._compute(x)
-        local_env['log'] = lambda x: Log(None)._compute(x)
-        local_env['neg'] = lambda x: Neg(None)._compute(x)
-        local_env['inv'] = lambda x: Inv(None)._compute(x)
-        local_env['rank'] = lambda x: Rank(None)._compute(x)
-        local_env['max'] = lambda x, y: Max(None, None)._compute(x, y)
-        local_env['min'] = lambda x, y: Min(None, None)._compute(x, y)
+        # Add operator classes with direct computation and scalar conversion
+        local_env['abs'] = lambda x: Abs(None)._compute(to_tensor(x))
+        local_env['log'] = lambda x: Log(None)._compute(to_tensor(x))
+        local_env['neg'] = lambda x: Neg(None)._compute(to_tensor(x))
+        local_env['inv'] = lambda x: Inv(None)._compute(to_tensor(x))
+        local_env['rank'] = lambda x: Rank(None)._compute(to_tensor(x))
+        local_env['max'] = lambda x, y: Max(None, None)._compute(to_tensor(x), to_tensor(y))
+        local_env['min'] = lambda x, y: Min(None, None)._compute(to_tensor(x), to_tensor(y))
         
-        # Add rolling operators with window size parameter
-        local_env['ts_mean'] = lambda x, w: TsMean(None, w)._compute(x)
-        local_env['ts_std'] = lambda x, w: TsStd(None, w)._compute(x)
-        local_env['ts_max'] = lambda x, w: TsMax(None, w)._compute(x)
-        local_env['ts_min'] = lambda x, w: TsMin(None, w)._compute(x)
-        local_env['pctchange'] = lambda x, w: PctChange(None, w)._compute(x)
-        local_env['lag'] = lambda x, w: Lag(None, w)._compute(x)
-        local_env['ts_corr'] = lambda x, y, w: TsCorr(None, None, w)._compute(x, y)
+        # Add rolling operators with window size parameter and scalar conversion
+        local_env['ts_mean'] = lambda x, w: TsMean(None, w)._compute(to_tensor(x))
+        local_env['ts_std'] = lambda x, w: TsStd(None, w)._compute(to_tensor(x))
+        local_env['ts_max'] = lambda x, w: TsMax(None, w)._compute(to_tensor(x))
+        local_env['ts_min'] = lambda x, w: TsMin(None, w)._compute(to_tensor(x))
+        local_env['pctchange'] = lambda x, w: PctChange(None, w)._compute(to_tensor(x))
+        local_env['lag'] = lambda x, w: Lag(None, w)._compute(to_tensor(x))
+        local_env['ts_corr'] = lambda x, y, w: TsCorr(None, None, w)._compute(to_tensor(x), to_tensor(y))
         
         # Evaluate the expression
         result = eval(expression, {"__builtins__": {}}, local_env)
