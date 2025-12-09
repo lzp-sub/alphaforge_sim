@@ -36,16 +36,19 @@ class AlphaForge:
         self.device = device
 
         self.sep = ['SEP']
-        self.unary_ops, self.binary_ops = generate_operators(window_sizes)
-        self.unary_op_names, self.binary_op_names = list(self.unary_ops.keys()), list(self.binary_ops.keys())
+        self.unary_ops, self.binary_ops, self.constants = generate_operators(window_sizes, include_constants=True)
+        self.unary_op_names = list(self.unary_ops.keys())
+        self.binary_op_names = list(self.binary_ops.keys())
+        self.constant_names = list(self.constants.keys())
         self.feature_names = list(self.feature_data.keys())
-        self.action_space = self.unary_op_names + self.binary_op_names + self.feature_names + self.sep
+        self.action_space = self.unary_op_names + self.binary_op_names + self.feature_names + self.constant_names + self.sep
         self.action_size = len(self.action_space)
 
         self.offset_unary = 0
         self.offset_binary = self.offset_unary + len(self.unary_ops)
         self.offset_feature = self.offset_binary + len(self.binary_ops)
-        self.offset_sep = self.offset_feature + len(self.feature_data)
+        self.offset_constant = self.offset_feature + len(self.feature_data)
+        self.offset_sep = self.offset_constant + len(self.constants)
 
         self.netp = NetP(self.action_size, hidden_size, dropout=0.1).to(self.device)
         self.netg = NetG(self.action_size, hidden_size, self.max_length + 1).to(self.device)
@@ -63,8 +66,10 @@ class AlphaForge:
             return self.unary_op_names[action - self.offset_unary]
         elif action < self.offset_feature:
             return self.binary_op_names[action - self.offset_binary]
-        elif action < self.offset_sep:
+        elif action < self.offset_constant:
             return self.feature_names[action - self.offset_feature]
+        elif action < self.offset_sep:
+            return self.constant_names[action - self.offset_constant]
         elif action == self.offset_sep:
             return 'SEP' # the end token
         else:
@@ -80,9 +85,9 @@ class AlphaForge:
         elif len(state) == self.max_length - 1 and len(stack) == 2:
             valid_actions[self.offset_binary: self.offset_feature] = 1 # only binary ops are allowed
 
-        elif len(stack) == 0: # only features are allowed
+        elif len(stack) == 0: # only features and constants are allowed
             valid_actions[self.offset_feature: self.offset_sep] = 1
-        elif len(stack) == 1: # only features and unary ops and SEP are allowed
+        elif len(stack) == 1: # only features, constants, unary ops and SEP are allowed
             valid_actions[self.offset_unary: self.offset_binary] = 1
             valid_actions[self.offset_feature: self.offset_sep] = 1
             valid_actions[self.offset_sep] = 1
@@ -91,37 +96,89 @@ class AlphaForge:
         else:
             raise ValueError
         
+        # Enhanced masker checking to prevent invalid operations
         if state.shape[0] > 0:
             last_action = state[-1].argmax().item()
-            if 'ops_neg' in self._action_to_token(last_action):
-                valid_actions[last_action] = 0 # prevent double negation
-            elif 'ops_rank' in self._action_to_token(last_action):
-                valid_actions[last_action] = 0 # prevent double rank
-            elif 'ops_inv' in self._action_to_token(last_action):
-                valid_actions[last_action] = 0 # prevent double inversion
-            elif 'ops_abs' in self._action_to_token(last_action):
-                valid_actions[last_action] = 0 # prevent double absolute
+            last_token = self._action_to_token(last_action)
+            
+            # Prevent double negation
+            if 'Neg' in last_token:
+                for i, name in enumerate(self.unary_op_names):
+                    if 'Neg' in name:
+                        valid_actions[self.offset_unary + i] = 0
+            
+            # Prevent double rank
+            if 'Rank' in last_token:
+                for i, name in enumerate(self.unary_op_names):
+                    if 'Rank' in name:
+                        valid_actions[self.offset_unary + i] = 0
+            
+            # Prevent double inversion
+            if 'Inv' in last_token:
+                for i, name in enumerate(self.unary_op_names):
+                    if 'Inv' in name:
+                        valid_actions[self.offset_unary + i] = 0
+            
+            # Prevent double absolute
+            if 'Abs' in last_token:
+                for i, name in enumerate(self.unary_op_names):
+                    if 'Abs' in name:
+                        valid_actions[self.offset_unary + i] = 0
 
         return valid_actions
 
-    def _step_action(self, stack: List[torch.Tensor], action: int):
+    def _step_action(self, stack: List, action: int):
         if action < self.offset_unary or action > self.offset_sep:
             raise ValueError
 
         token = self._action_to_token(action)
+        
         if action < self.offset_binary: # action = unary ops
-            data = stack.pop()
-            operator = self.unary_ops[token]
-            result = operator(data)
+            operand = stack.pop()
+            operator_class = self.unary_ops[token]
+            # Check if it's a rolling operator (returns a lambda)
+            if callable(operator_class) and not isinstance(operator_class, type):
+                # It's a lambda that creates the operator
+                operator = operator_class(operand)
+            else:
+                # It's a regular operator class
+                operator = operator_class(operand)
+            
+            # If operand is a tensor, compute directly; if Expression, store the expression tree
+            if isinstance(operand, torch.Tensor):
+                result = operator.evaluate({}) if hasattr(operator, 'evaluate') else operator._compute(operand)
+            else:
+                result = operator
             stack.append(result)
+            
         elif action < self.offset_feature: # action = binary ops
-            data1 = stack.pop()
-            data2 = stack.pop()
-            operator = self.binary_ops[token]
-            result = operator(data1, data2)
+            rhs = stack.pop()
+            lhs = stack.pop()
+            operator_class = self.binary_ops[token]
+            # Check if it's a rolling operator (returns a lambda)
+            if callable(operator_class) and not isinstance(operator_class, type):
+                # It's a lambda that creates the operator
+                operator = operator_class(lhs, rhs)
+            else:
+                # It's a regular operator class
+                operator = operator_class(lhs, rhs)
+            
+            # If both operands are tensors, compute directly
+            if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
+                result = operator.evaluate({}) if hasattr(operator, 'evaluate') else operator._compute(lhs, rhs)
+            else:
+                result = operator
             stack.append(result)
-        elif action < self.offset_sep: # action = features
+            
+        elif action < self.offset_constant: # action = features
             stack.append(self.feature_data[token])
+            
+        elif action < self.offset_sep: # action = constants
+            constant = self.constants[token]
+            # Evaluate constant to get tensor
+            result = constant.evaluate(self.feature_data)
+            stack.append(result)
+            
         elif action == self.offset_sep: # action = SEP
             pass
 
@@ -174,23 +231,88 @@ class AlphaForge:
         return state, metric, one_hot
     
     def _state_to_expression(self, state) -> str:
+        """Convert state to expression string using operator classes"""
+        from .operators import (Expression, Constant, UnaryOperator, BinaryOperator, 
+                                RollingOperator, TsCorr)
+        
         stack = []
         for t in range(state.shape[0]):
             action = state[t].argmax().item()
             token = self._action_to_token(action)
 
-            if token in self.feature_data:
+            if token in self.feature_names:
                 stack.append(token)
+            elif token in self.constant_names:
+                constant = self.constants[token]
+                stack.append(str(constant))
             elif token in self.unary_ops:
-                x = stack.pop()
-                stack.append(token + '(' + x + ')')
+                if len(stack) == 0:
+                    break
+                operand_str = stack.pop()
+                operator_class = self.unary_ops[token]
+                
+                # Create operator instance with dummy operand for string representation
+                if callable(operator_class) and not isinstance(operator_class, type):
+                    # It's a lambda for rolling operators
+                    # We need to extract the window size from the token name
+                    if '_' in token:
+                        parts = token.rsplit('_', 1)
+                        window = int(parts[1])
+                        class_name = parts[0]
+                        # Create a temporary operator to get its string representation
+                        from .operators import TsMean, TsStd, TsMax, TsMin, PctChange, Lag
+                        operator_map = {
+                            'TsMean': TsMean, 'TsStd': TsStd, 'TsMax': TsMax,
+                            'TsMin': TsMin, 'PctChange': PctChange, 'Lag': Lag
+                        }
+                        if class_name in operator_map:
+                            # Create instance with string operand
+                            temp_op = operator_map[class_name](None, window)
+                            temp_op._operand = operand_str
+                            expr_str = str(temp_op)
+                        else:
+                            expr_str = f"{token}({operand_str})"
+                    else:
+                        expr_str = f"{token}({operand_str})"
+                else:
+                    # Regular unary operator
+                    temp_op = operator_class(None)
+                    temp_op._operand = operand_str
+                    expr_str = str(temp_op)
+                
+                stack.append(expr_str)
+                
             elif token in self.binary_ops:
-                y = stack.pop()
-                x = stack.pop()
-                stack.append(token + '(' + x + ',' + y + ')')
+                if len(stack) < 2:
+                    break
+                rhs_str = stack.pop()
+                lhs_str = stack.pop()
+                operator_class = self.binary_ops[token]
+                
+                # Create operator instance with dummy operands for string representation
+                if callable(operator_class) and not isinstance(operator_class, type):
+                    # It's a lambda for TsCorr
+                    if 'TsCorr' in token:
+                        window = int(token.split('_')[-1])
+                        temp_op = TsCorr(None, None, window)
+                        temp_op._lhs = lhs_str
+                        temp_op._rhs = rhs_str
+                        expr_str = str(temp_op)
+                    else:
+                        expr_str = f"{token}({lhs_str},{rhs_str})"
+                else:
+                    # Regular binary operator
+                    temp_op = operator_class(None, None)
+                    temp_op._lhs = lhs_str
+                    temp_op._rhs = rhs_str
+                    expr_str = str(temp_op)
+                
+                stack.append(expr_str)
+                
             elif token == 'SEP':
                 break
-        return stack[0]        
+                
+        return stack[0] if len(stack) > 0 else ""        
 
     def _evaluate_factor(self, expr, corr_threshold) -> bool:
         factor = self.calculate_expression(expr)
@@ -358,16 +480,101 @@ class AlphaForge:
         return self.alpha_pool
 
     def calculate_expression(self, expression, feature_data=None, rank=False) -> torch.Tensor:
+        """Calculate expression result from string representation
+        
+        Supports both new mathematical notation (a+b, a*b) and old function notation (ops_add(a,b))
+        """
         if feature_data is None:
             feature_data = self.feature_data
 
+        # Import necessary classes and functions
+        from .operators import (Abs, Log, Neg, Inv, Rank, Add, Sub, Mul, Div, Max, Min,
+                               TsMean, TsStd, TsMax, TsMin, PctChange, Lag, TsCorr, Constant,
+                               ops_abs, ops_log, ops_neg, ops_inv, ops_rank,
+                               ops_add, ops_subtract, ops_multiply, ops_divide, ops_max, ops_min)
+        
+        # Helper function to evaluate operators on tensors
+        def evaluate_operator(op_class, *args, **kwargs):
+            """Evaluate an operator class with tensor arguments"""
+            if len(args) == 1:
+                # Unary operator
+                return op_class(None, **kwargs)._compute(args[0])
+            elif len(args) == 2:
+                # Binary operator
+                return op_class(None, None, **kwargs)._compute(args[0], args[1])
+            else:
+                raise ValueError(f"Unexpected number of arguments: {len(args)}")
+        
+        # Build local environment for eval
         local_env = {}
-        for op_name, op_func in self.unary_ops.items():
-            local_env[op_name] = op_func
-        for op_name, op_func in self.binary_ops.items():
-            local_env[op_name] = op_func
+        
+        # Add feature data
         for feature_name in self.feature_names:
             local_env[feature_name] = feature_data[feature_name]
         
+        # Add new-style operator classes with tensor evaluation
+        local_env['abs'] = lambda x: Abs(None)._compute(x)
+        local_env['log'] = lambda x: Log(None)._compute(x)
+        local_env['rank'] = lambda x: Rank(None)._compute(x)
+        local_env['max'] = lambda x, y: Max(None, None)._compute(x, y)
+        local_env['min'] = lambda x, y: Min(None, None)._compute(x, y)
+        
+        # Add rolling operators for each window size
+        for token in self.unary_op_names:
+            if 'TsMean_' in token or 'ts_mean_' in token:
+                window = int(token.split('_')[-1])
+                local_env[f'ts_mean_{window}'] = lambda x, w=window: TsMean(None, w)._compute(x)
+            elif 'TsStd_' in token or 'ts_std_' in token:
+                window = int(token.split('_')[-1])
+                local_env[f'ts_std_{window}'] = lambda x, w=window: TsStd(None, w)._compute(x)
+            elif 'TsMax_' in token or 'ts_max_' in token:
+                window = int(token.split('_')[-1])
+                local_env[f'ts_max_{window}'] = lambda x, w=window: TsMax(None, w)._compute(x)
+            elif 'TsMin_' in token or 'ts_min_' in token:
+                window = int(token.split('_')[-1])
+                local_env[f'ts_min_{window}'] = lambda x, w=window: TsMin(None, w)._compute(x)
+            elif 'PctChange_' in token or 'pctchange_' in token:
+                window = int(token.split('_')[-1])
+                local_env[f'pctchange_{window}'] = lambda x, w=window: PctChange(None, w)._compute(x)
+            elif 'Lag_' in token or 'lag_' in token:
+                window = int(token.split('_')[-1])
+                local_env[f'lag_{window}'] = lambda x, w=window: Lag(None, w)._compute(x)
+        
+        for token in self.binary_op_names:
+            if 'TsCorr_' in token or 'ts_corr_' in token:
+                window = int(token.split('_')[-1])
+                local_env[f'ts_corr_{window}'] = lambda x, y, w=window: TsCorr(None, None, w)._compute(x, y)
+        
+        # Add legacy function-based operators for backward compatibility
+        local_env['ops_abs'] = ops_abs
+        local_env['ops_log'] = ops_log
+        local_env['ops_neg'] = ops_neg
+        local_env['ops_inv'] = ops_inv
+        local_env['ops_rank'] = ops_rank
+        local_env['ops_add'] = ops_add
+        local_env['ops_subtract'] = ops_subtract
+        local_env['ops_multiply'] = ops_multiply
+        local_env['ops_divide'] = ops_divide
+        local_env['ops_max'] = ops_max
+        local_env['ops_min'] = ops_min
+        
+        # Add legacy rolling operators
+        for token in self.unary_op_names:
+            if token in self.unary_ops:
+                op_func = self.unary_ops[token]
+                # For rolling operators created with lambda, we need to handle them
+                if 'rolling_mean' in token.lower() or 'lag' in token.lower() or 'pct' in token.lower():
+                    # These are already in the unary_ops as partial functions or lambdas
+                    # We'll try to add them if they're callable
+                    if callable(op_func):
+                        local_env[token] = op_func
+        
+        for token in self.binary_op_names:
+            if token in self.binary_ops:
+                op_func = self.binary_ops[token]
+                if callable(op_func):
+                    local_env[token] = op_func
+        
+        # Evaluate the expression
         result = eval(expression, {"__builtins__": {}}, local_env)
         return ops_rank(result) if rank else result
